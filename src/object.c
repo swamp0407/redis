@@ -219,8 +219,6 @@ robj *dupStringObject(const robj *o) {
  * The resulting object always has refcount set to 1 */
 robj *dupListObject(robj *o) {
     robj *lobj;
-    long llen, start = 0;
-    char buf[64];
 
     serverAssert(o->type == OBJ_LIST);
 
@@ -232,23 +230,7 @@ robj *dupListObject(robj *o) {
             serverPanic("Wrong encoding.");
             break;
     }
-    quicklistSetOptions(lobj->ptr, server.list_max_ziplist_size, server.list_compress_depth);
-    llen = listTypeLength(o);
-    listTypeIterator *iter = listTypeInitIterator(o, start, LIST_TAIL);
-    while (llen--) {
-        listTypeEntry entry;
-        listTypeNext(iter, &entry);
-        quicklistEntry *qe = &entry.entry;
-        if (qe->value) {
-            robj *obj = createObject(OBJ_STRING, sdsnewlen((const char *)qe->value, qe->sz));
-            listTypePush(lobj, obj, LIST_TAIL);
-        } else {
-            ll2string(buf, 64, qe->longval);
-            robj *obj = createObject(OBJ_STRING, sdsnewlen((const char *)buf, strlen(buf)));
-            listTypePush(lobj, obj, LIST_TAIL);
-        }
-    }
-    listTypeReleaseIterator(iter);
+    lobj->ptr = quicklistDup(o->ptr);
     return lobj;
 }
 /* This is a helper function for the COPY command.
@@ -298,8 +280,7 @@ robj *dupSetObject(robj *o) {
  * The resulting object always has refcount set to 1 */
 robj *dupZsetObject(robj *o) {
     robj *zobj;
-    char buf[64];
-    long llen, start = 0;
+    long llen;
     int retflags = ZADD_NONE;
 
     serverAssert(o->type == OBJ_ZSET);
@@ -319,32 +300,11 @@ robj *dupZsetObject(robj *o) {
     llen = zsetLength(o);
     if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *zl = o->ptr;
-        unsigned char *eptr, *sptr;
-        unsigned char *vstr;
-        unsigned int vlen;
-        long long vlong;
-        double score;
-
-        eptr = ziplistIndex(zl, 2 * start);
-        sptr = ziplistNext(zl, eptr);
-
-        /* Extract score-element pair from an original zset object. 
-         * add a score-element pair to a new zset object which encoding is ZIPLIST.*/
-        while (llen--) {
-            ziplistGet(eptr, &vstr, &vlen, &vlong);
-            score = zzlGetScore(sptr);
-            if (vstr == NULL) {
-                ll2string(buf, 64, vlong);
-                sds ele = sdsnewlen((const char *)buf, strlen(buf));
-                zsetAdd(zobj, score, ele, &retflags, NULL);
-                sdsfree(ele);
-            } else {
-                sds ele = sdsnewlen((const char *)vstr, vlen);
-                zsetAdd(zobj, score, ele, &retflags, NULL);
-                sdsfree(ele);
-            }
-            zzlNext(zl, &eptr, &sptr);
-        }
+        size_t sz = ziplistBlobLen(zl);
+        unsigned char *new_zl = zmalloc(sz);
+        memcpy(new_zl, zl, sz);
+        zfree(zobj->ptr);
+        zobj->ptr = new_zl;
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = o->ptr;
         zskiplist *zsl = zs->zsl;
@@ -461,108 +421,102 @@ robj *dupStreamObject(robj *o) {
     streamID id;
     stream *s;
     stream *new_s;
-    streamID startid;
-    streamID endid;
-    int64_t numfields;
-    int rev = 0;
-
-    startid.ms = startid.seq = 0;
-    endid.ms = endid.seq = UINT64_MAX;
     s = o->ptr;
     new_s = sobj->ptr;
 
-    streamIterator si;
-    streamIteratorStart(&si, s, &startid, &endid, rev);
-    while (streamIteratorGetID(&si, &id, &numfields)) {
-        /* Extract field-value pairs from an original stream object
-         * and, add these to a new stream object. */
-        robj **argv;
-        argv = zmalloc(sizeof(robj *) * numfields * 2);
-        for (int j = 0; j < numfields; j++) {
-            unsigned char *key, *value;
-            int64_t key_len, value_len;
-
-            streamIteratorGetField(&si, &key, &value, &key_len, &value_len);
-            argv[j * 2] = createObject(OBJ_STRING, sdsnewlen((const char *)key, key_len));
-            argv[j * 2 + 1] = createObject(OBJ_STRING, sdsnewlen((const char *)value, value_len));
-        }
-        streamAppendItem(new_s, argv, numfields, &id, &id);
-        zfree(argv);
+    raxIterator ri;
+    uint64_t rax_key[2];
+    raxStart(&ri, s->rax);
+    raxSeek(&ri, "$", NULL, 0);
+    size_t lp_bytes = 0;      /* Total bytes in the tail listpack. */
+    unsigned char *lp = NULL; /* Tail listpack pointer. */
+    /* Get a reference to the tail node listpack. */
+    if (raxNext(&ri)) {
+        lp = ri.data;
+        lp_bytes = lpBytes(lp);
+        unsigned char *new_lp = zmalloc(lp_bytes);
+        memcpy(new_lp, lp, lp_bytes);
+        memcpy(rax_key, ri.key, sizeof(rax_key));
+        raxInsert(new_s->rax, (unsigned char *)&rax_key, sizeof(rax_key),
+                  new_lp, NULL);
+        streamDecodeID(ri.key, &id);
     }
-    streamIteratorStop(&si);
+    new_s->length = s->length;
+    new_s->last_id = s->last_id;
+    raxStop(&ri);
 
-    if (s->cgroups == NULL) {
-        /*Nothing to do*/
-    } else {
-        /* Consumer Groups */
-        raxIterator ri_cgroups;
-        raxStart(&ri_cgroups, s->cgroups);
-        raxSeek(&ri_cgroups, "^", NULL, 0);
-        while (raxNext(&ri_cgroups)) {
-            streamCG *cg = ri_cgroups.data;
-            streamCG *new_cg = streamCreateCG(new_s, (char *)ri_cgroups.key,
-                                              ri_cgroups.key_len, &cg->last_id);
-            /* If already exists */
-            if (new_cg == NULL) {
-                new_cg = raxFind(s->cgroups, ri_cgroups.key, ri_cgroups.key_len);
+    if (s->cgroups == NULL) return sobj;
+
+    /* Consumer Groups */
+    raxIterator ri_cgroups;
+    raxStart(&ri_cgroups, s->cgroups);
+    raxSeek(&ri_cgroups, "^", NULL, 0);
+    while (raxNext(&ri_cgroups)) {
+        streamCG *cg = ri_cgroups.data;
+        streamCG *new_cg = streamCreateCG(new_s, (char *)ri_cgroups.key,
+                                          ri_cgroups.key_len, &cg->last_id);
+
+        serverAssert(new_cg != NULL);
+
+        /* Consumers */
+        raxIterator ri_consumers;
+        raxStart(&ri_consumers, cg->consumers);
+        raxSeek(&ri_consumers, "^", NULL, 0);
+        while (raxNext(&ri_consumers)) {
+            streamConsumer *consumer = ri_consumers.data;
+            streamConsumer *new_consumer =
+                raxFind(new_cg->consumers, (unsigned char *)consumer->name,
+                        sdslen(consumer->name));
+            if (new_consumer == raxNotFound) {
+                new_consumer = zmalloc(sizeof(*new_consumer));
+                new_consumer->name = sdsdup(consumer->name);
+                new_consumer->pel = raxNew();
+                raxInsert(new_cg->consumers,
+                          (unsigned char *)new_consumer->name,
+                          sdslen(new_consumer->name), new_consumer, NULL);
+                new_consumer->seen_time = consumer->seen_time;
             }
 
-            /* Consumers */
-            raxIterator ri_consumers;
-            raxStart(&ri_consumers, cg->consumers);
-            raxSeek(&ri_consumers, "^", NULL, 0);
-            while (raxNext(&ri_consumers)) {
-                streamConsumer *consumer = ri_consumers.data;
-                streamConsumer *new_consumer = raxFind(new_cg->consumers, 
-                                (unsigned char *)consumer->name, sdslen(consumer->name));
-                if (new_consumer == raxNotFound) {
-                    new_consumer = zmalloc(sizeof(*new_consumer));
-                    new_consumer->name = sdsdup(consumer->name);
-                    new_consumer->pel = raxNew();
-                    raxInsert(new_cg->consumers, (unsigned char *)new_consumer->name, 
-                                    sdslen(new_consumer->name), new_consumer, NULL);
-                    new_consumer->seen_time = consumer->seen_time;
-                }
+            /* Consumer PEL */
+            raxIterator ri_cpel;
+            raxStart(&ri_cpel, consumer->pel);
+            raxSeek(&ri_cpel, "^", NULL, 0);
+            while (raxNext(&ri_cpel)) {
+                unsigned char buf[sizeof(streamID)];
+                streamNACK *nack = ri_cpel.data;
+                streamDecodeID(ri_cpel.key, &id);
+                streamEncodeID(buf, &id);
+                /* Insert NACK. */
+                streamNACK *new_nack = zmalloc(sizeof(*new_nack));
+                new_nack->delivery_time = nack->delivery_time;
+                new_nack->delivery_count = nack->delivery_count;
+                new_nack->consumer = new_consumer;
+                int group_inserted =
+                    raxTryInsert(new_cg->pel, buf, sizeof(buf), new_nack, NULL);
+                int consumer_inserted = raxTryInsert(
+                    new_consumer->pel, buf, sizeof(buf), new_nack, NULL);
 
-                /* Consumer PEL */
-                raxIterator ri_cpel;
-                raxStart(&ri_cpel, consumer->pel);
-                raxSeek(&ri_cpel, "^", NULL, 0);
-                while (raxNext(&ri_cpel)) {
-                    unsigned char buf[sizeof(streamID)];
-                    streamNACK *nack = ri_cpel.data;
-                    streamDecodeID(ri_cpel.key,&id);
-                    streamEncodeID(buf, &id);
-                    /* Insert NACK. */
-                    streamNACK *new_nack = zmalloc(sizeof(*new_nack));
+                if (group_inserted == 0) {
+                    streamFreeNACK(new_nack);
+                    new_nack = raxFind(new_cg->pel, buf, sizeof(buf));
+                    serverAssert(new_nack != raxNotFound);
+                    raxRemove(new_nack->consumer->pel, buf, sizeof(buf), NULL);
+                    /* Update the consumer and NACK metadata. */
                     new_nack->delivery_time = nack->delivery_time;
                     new_nack->delivery_count = nack->delivery_count;
                     new_nack->consumer = new_consumer;
-                    int group_inserted = raxTryInsert(new_cg->pel, buf, sizeof(buf), new_nack, NULL);
-                    int consumer_inserted = raxTryInsert(new_consumer->pel, buf, sizeof(buf), new_nack, NULL);
-
-                    if (group_inserted == 0) {
-                        streamFreeNACK(new_nack);
-                        new_nack = raxFind(new_cg->pel, buf, sizeof(buf));
-                        serverAssert(new_nack != raxNotFound);
-                        raxRemove(new_nack->consumer->pel, buf, sizeof(buf), NULL);
-                        /* Update the consumer and NACK metadata. */
-                        new_nack->delivery_time = nack->delivery_time;
-                        new_nack->delivery_count = nack->delivery_count;
-                        new_nack->consumer = new_consumer;
-                        /* Add the entry in the new consumer local PEL. */
-                        raxInsert(new_consumer->pel, buf, sizeof(buf), new_nack, NULL);
-                    } else if (group_inserted == 1 && consumer_inserted == 0) {
-                        serverPanic(
-                            "NACK half-created. Should not be possible.");
-                    }
+                    /* Add the entry in the new consumer local PEL. */
+                    raxInsert(new_consumer->pel, buf, sizeof(buf), new_nack,
+                              NULL);
+                } else if (group_inserted == 1 && consumer_inserted == 0) {
+                    serverPanic("NACK half-created. Should not be possible.");
                 }
-                raxStop(&ri_cpel);
             }
-            raxStop(&ri_consumers);
+            raxStop(&ri_cpel);
         }
-        raxStop(&ri_cgroups);
+        raxStop(&ri_consumers);
     }
+    raxStop(&ri_cgroups);
     return sobj;
 }
 

@@ -175,7 +175,7 @@ start_server {tags {"keyspace"}} {
         r copy mykey mynewkey
         lappend res [r get mynewkey]
         lappend res [r dbsize]
-        r copy mykey mynewkey 10
+        r copy mykey mynewkey DB 10
         r select 10
         lappend res [r get mynewkey]
         lappend res [r dbsize]
@@ -185,12 +185,12 @@ start_server {tags {"keyspace"}} {
 
     test {COPY for string does not replace an existing key without REPLACE option} {
         r set mykey2 hello
-        catch {r copy mykey2 mynewkey 10} e
+        catch {r copy mykey2 mynewkey DB 10} e
         set e
     } {0}
 
     test {COPY for string can replace an existing key with REPLACE option} {
-        r copy mykey2 mynewkey 10 REPLACE
+        r copy mykey2 mynewkey DB 10 REPLACE
         r select 10
         r get mynewkey
     } {hello}
@@ -200,7 +200,7 @@ start_server {tags {"keyspace"}} {
         r select 9
         r set mykey foobar
         set res {}
-        r copy mykey mynewkey 10
+        r copy mykey mynewkey DB 10
         r select 10
         lappend res [r get mynewkey]
         r set mynewkey hoge
@@ -215,7 +215,7 @@ start_server {tags {"keyspace"}} {
 
     test {COPY for string does not copy data to no-integer DB} {
         r set mykey foobar
-        catch {r copy mykey mynewkey notanumber} e
+        catch {r copy mykey mynewkey DB notanumber} e
         set e
     } {*ERR*index out of range}
 
@@ -233,6 +233,106 @@ start_server {tags {"keyspace"}} {
         assert {[r ttl mynewkey] == -1}
         assert {[r get mynewkey] eq "foobar"}
         r flushdb
+    }
+
+    test {COPY basic usage for list} {
+        r del mylist
+        r lpush mylist a b c d
+        copy mylist newmylist
+        set res {}
+        lappend res [r lrange newmylist 0 -1]
+        lappend res [r dbsize]
+        r copy mylist mynewlist DB 10
+        r select 10
+        lappend res [r lrange newmylist 0 -1]
+        lappend res [r dbsize]
+        r flushdb
+        r select 9
+        format $res
+    } [list {d c b a} 2 {d c b a} 1]
+
+    test {COPY basic usage for set} {
+        r set mykey foobar
+        set res {}
+        r copy mykey mynewkey
+        lappend res [r get mynewkey]
+        lappend res [r dbsize]
+        r copy mykey mynewkey DB 10
+        r select 10
+        lappend res [r get mynewkey]
+        lappend res [r dbsize]
+        r select 9
+        format $res
+    } [list foobar 2 foobar 1]
+
+    test {COPY basic usage for sorted set} {
+        r set mykey foobar
+        set res {}
+        r copy mykey mynewkey
+        lappend res [r get mynewkey]
+        lappend res [r dbsize]
+        r copy mykey mynewkey DB 10
+        r select 10
+        lappend res [r get mynewkey]
+        lappend res [r dbsize]
+        r select 9
+        format $res
+    } [list foobar 2 foobar 1]
+
+    test {COPY basic usage for hash} {
+        r del smallhash
+        r hset smallhash tmp 17179869184
+        r copy smallhash newsmallhash
+        set digest [r debug digest-key smallhash]
+        assert_equal digest [r debug digest-key newsmallhash]
+        r flushdb
+    }
+
+    test {COPY basic usage for stream} {
+        r del mystream
+        r XADD mystream * item 1 value a
+        r XADD mystream * item 2 value b
+        r copy mystream newmystream
+        set digest [r debug digest-key smallhash]
+        assert_equal digest [r debug digest-key newsmallhash]
+        set items [r XRANGE newmystream - +]
+        assert_equal [lindex $items 0 1] {item 1 value a}
+        assert_equal [lindex $items 1 1] {item 2 value b}
+    }
+
+    test {COPY basic usage for stream-cgroups} {
+        r del x
+        r XADD x 100 a 1
+        r XADD x 101 b 1
+        r XADD x 102 c 1
+        r XADD x 103 e 1
+        r XADD x 104 f 1
+        r XGROUP CREATE x g1 0
+        r XGROUP CREATE x g2 0
+        r XREADGROUP GROUP g1 Alice COUNT 1 STREAMS x >
+        r XREADGROUP GROUP g1 Bob COUNT 1 STREAMS x >
+        r XREADGROUP GROUP g1 Bob NOACK COUNT 1 STREAMS x >
+        r XREADGROUP GROUP g2 Charlie COUNT 4 STREAMS x >
+        r XDEL x 103
+
+        r copy x newx
+        set reply [r XINFO STREAM newx FULL]
+        assert_equal [llength $reply] 12
+        assert_equal [lindex $reply 1] 4 ;# stream length
+        assert_equal [lindex $reply 9] "{100-0 {a 1}} {101-0 {b 1}} {102-0 {c 1}} {104-0 {f 1}}" ;# entries
+        assert_equal [lindex $reply 11 0 1] "g1" ;# first group name
+        assert_equal [lindex $reply 11 0 7 0 0] "100-0" ;# first entry in group's PEL
+        assert_equal [lindex $reply 11 0 9 0 1] "Alice" ;# first consumer
+        assert_equal [lindex $reply 11 0 9 0 7 0 0] "100-0" ;# first entry in first consumer's PEL
+        assert_equal [lindex $reply 11 1 1] "g2" ;# second group name
+        assert_equal [lindex $reply 11 1 9 0 1] "Charlie" ;# first consumer
+        assert_equal [lindex $reply 11 1 9 0 7 0 0] "100-0" ;# first entry in first consumer's PEL
+        assert_equal [lindex $reply 11 1 9 0 7 1 0] "101-0" ;# second entry in first consumer's PEL
+
+        set reply [r XINFO STREAM newx FULL COUNT 1]
+        assert_equal [llength $reply] 12
+        assert_equal [lindex $reply 1] 4
+        assert_equal [lindex $reply 9] "{100-0 {a 1}}"
     }
 
     test {MOVE basic usage} {
